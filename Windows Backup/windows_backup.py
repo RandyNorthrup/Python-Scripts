@@ -35,8 +35,9 @@ class MainWindow(QMainWindow):
         self.backup_buttons.append(self.create_button("Backup Downloads", self.backup_downloads))
 
         for btn in self.backup_buttons:
+            btn.setFixedSize(150, 40)  # Set button size
             btn.setEnabled(False)
-            layout.addWidget(btn)
+            layout.addWidget(btn)            
 
            
             
@@ -58,7 +59,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Please set a backup location first.")
             return
         
-        # Set Backup Location Script
+        
         destination = os.path.join(self.backup_location, os.path.basename(source))
         os.makedirs(destination, exist_ok=True)
         cmd = f'xcopy /E /I /Y "{source}" "{destination}"'
