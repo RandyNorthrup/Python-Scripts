@@ -38,3 +38,6 @@ pip install PySide6
 ## Disclaimer
 
 Always verify your backups. The author is not responsible for any data loss.
+
+## Created By:
+- Randy Northrup
