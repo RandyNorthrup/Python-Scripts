@@ -1,5 +1,4 @@
-import os
-import sys
+import os, sys
 from PySide6.QtWidgets import QMainWindow, QApplication, QPushButton, QVBoxLayout, QWidget, QFileDialog, QMessageBox
 
 class MainWindow(QMainWindow):
