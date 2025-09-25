@@ -1,8 +1,15 @@
-import os
+import os, platform
 from pyfiglet import Figlet
+
 text = Figlet(font="bubble")
-os.system("cls")
-os.system("mode con: cols=75 lines=30")
+
+# Clear screen cross-platform
+if os.name == "nt":
+    os.system("cls")
+    os.system("mode con: cols=75 lines=30")
+else:
+    os.system("clear")
+    # Terminal resizing is not standard on Unix, so it's usually skipped
 with open("FontArt.txt", "w") as f:
     f.write(text.renderText("Randy N"))
 print(text.renderText("Randy N"))
