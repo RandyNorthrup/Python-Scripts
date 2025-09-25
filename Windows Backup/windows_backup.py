@@ -1,5 +1,15 @@
 import re
 import sys
+import os
+import shutil
+import time
+import hashlib
+import datetime
+import json
+import threading
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 try:
     import plistlib
 except ImportError:
@@ -11,31 +21,70 @@ if sys.platform.startswith("win"):
         import winreg
     except ImportError:
         winreg = None
-import os, shutil, time, hashlib, datetime, json, threading, random
+else:
+    winreg = None
+
+# Optional pywin32
 try:
-    import win32api, win32con
-except ImportError:
+    import win32api, win32con  # type: ignore
+except Exception:
     win32api = win32con = None
+
 from PySide6.QtWidgets import (
     QMainWindow, QApplication, QPushButton, QWidget, QFileDialog, QMessageBox,
-    QGridLayout, QProgressDialog, QSpacerItem, QSizePolicy
+    QGridLayout, QProgressDialog, QSpacerItem, QSizePolicy, QCheckBox,
+    QDialog, QVBoxLayout, QListWidget, QAbstractItemView, QTableWidget,
+    QTableWidgetItem, QLabel
 )
-from PySide6.QtWidgets import QSizePolicy
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 
+# -----------------------------------------------------------------------------
+# Constants & helpers
+# -----------------------------------------------------------------------------
+USER_ROOT = os.path.expandvars(r"C:\\Users") if sys.platform.startswith("win") else "/Users"
+TIMESTAMP_FMT = "%Y-%m-%d_%H-%M-%S"
 
 
-def get_user_path(subpath=""):
-    """Return full path inside user's profile directory."""
-    user_profile = os.environ.get("USERPROFILE", "")
-    return os.path.join(user_profile, subpath) if subpath else user_profile
+def ensure_logs_dir(root_dir: str) -> str:
+    """Create and return a _logs directory inside root_dir."""
+    logs = os.path.join(root_dir, "_logs")
+    os.makedirs(logs, exist_ok=True)
+    return logs
 
 
+def new_log_file(root_dir: str, prefix: str) -> str:
+    ts = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    logs_dir = ensure_logs_dir(root_dir)
+    return os.path.join(logs_dir, f"{prefix}_{ts}.log")
+
+
+def log_line(path: str, text: str) -> None:
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text.rstrip("\n") + "\n")
+    except Exception:
+        pass
+
+
+def chunked_file_hash(filepath: str, chunk_size: int = 1024 * 1024) -> str:
+    hasher = hashlib.md5()
+    with open(filepath, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+# -----------------------------------------------------------------------------
+# Backup worker thread (multithreaded copy inside)
+# -----------------------------------------------------------------------------
 class BackupWorker(QThread):
-    progress_update = Signal(int, str, int, int, float)
-    finished = Signal(int, bool, str)
+    progress_update = Signal(int, str, int, int, float)  # files_processed, file, file_size, copied_size, speed
+    finished = Signal(int, bool, str)  # files_copied, success, message
 
-    def __init__(self, source_dir, destination_root, patterns):
+    def __init__(self, source_dir: str, destination_root: str, patterns, log_file: str, max_workers: int | None = None):
         super().__init__()
         self.source_dir = source_dir
         self.destination_root = destination_root
