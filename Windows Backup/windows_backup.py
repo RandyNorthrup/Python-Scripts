@@ -1,6 +1,17 @@
-import os, sys, shutil, time, hashlib, datetime, json
-import threading
-import random
+import re
+import sys
+try:
+    import plistlib
+except ImportError:
+    plistlib = None
+
+# Windows-specific imports
+if sys.platform.startswith("win"):
+    try:
+        import winreg
+    except ImportError:
+        winreg = None
+import os, shutil, time, hashlib, datetime, json, threading, random
 try:
     import win32api, win32con
 except ImportError:
@@ -95,6 +106,319 @@ class BackupWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("S.A.K. Utility")
+        self.setFixedSize(800, 600)
+        self.backup_location = ""
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QGridLayout()
+        central_widget.setLayout(layout)
+
+        # --- Alignment/spacing tweaks for clean layout ---
+        cols = 3
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+        for c in range(cols):
+            layout.setColumnStretch(c, 1)
+        # -------------------------------------------------
+
+        # Add Keep Screen On checkbox at the top
+        self.setup_keep_screen_on(layout, 8, cols)
+
+        # Add Dedupe Table (hidden by default, shown after scan)
+        self.setup_dedupe_table(layout, 9, cols)
+
+        # Set Backup Location Button (top row)
+        self.backup_location_button = QPushButton("Set Backup Location", self)
+        self.backup_location_button.setToolTip("Choose the folder where backups will be stored.")
+        self.backup_location_button.clicked.connect(self.set_backup_location)
+        layout.addWidget(self.backup_location_button, 0, 0, 1, cols)
+
+        # Map buttons to (source path, patterns, destination name)
+        self.backup_sources = {
+            "Backup Contacts": (get_user_path("Contacts"), ["*"], "Contacts"),
+            "Backup Photos": (get_user_path("Pictures"), ["*"], "Pictures"),
+            "Backup Documents": (get_user_path("Documents"), ["*"], "Documents"),
+            "Backup Videos": (get_user_path("Videos"), ["*"], "Videos"),
+            "Backup Music": (get_user_path("Music"), ["*"], "Music"),
+            "Backup Desktop": (get_user_path("Desktop"), ["*"], "Desktop"),
+            "Backup Downloads": (get_user_path("Downloads"), ["*"], "Downloads"),
+            "Backup Outlook Files": (get_user_path("AppData/Local/Microsoft/Outlook"),
+                                     ["*.pst", "*.ost", "*.nst"], "Outlook"),
+        }
+
+        # Create buttons in a predictable left-to-right, top-to-bottom order
+        self.backup_buttons = []
+        for idx, (name, (src, pats, dest)) in enumerate(self.backup_sources.items()):
+            btn = self.create_button(name, lambda checked=False, n=name: self.start_backup(*self.backup_sources[n]))
+            btn.setToolTip(f"Backup all files from {src} to your backup location as '{dest}'.")
+            btn.setFixedSize(180, 42)
+            btn.setEnabled(False)
+            self.backup_buttons.append((btn, name))
+
+            # --- Correct grid placement (fixes orientation/alignment) ---
+            row = 1 + (idx // cols)      # first row after the header
+            col = idx % cols             # 0, 1, 2, ...
+            layout.addWidget(btn, row, col)
+            # ------------------------------------------------------------
+
+        # Place Organize, De-Duplicate, and Scan License Keys buttons in a new row below backup buttons, with a blank row in between
+        action_row = 2 + ((len(self.backup_sources) + cols - 1) // cols)
+        # Add a blank spacer row (no widgets added to row action_row - 1)
+        self.organize_button = QPushButton("Organize Directory", self)
+        self.organize_button.setToolTip("Organize all files in a selected directory into subfolders by file extension.")
+        self.organize_button.clicked.connect(self.organize_directory)
+        self.organize_button.setFixedSize(180, 42)
+        layout.addWidget(self.organize_button, action_row, 0)
+
+        self.dedup_button = QPushButton("De-Duplicate", self)
+        self.dedup_button.setToolTip("Scan a folder for duplicate files and take action on them.")
+        self.dedup_button.clicked.connect(self.run_deduplication)
+        self.dedup_button.setFixedSize(180, 42)
+        layout.addWidget(self.dedup_button, action_row, 1)
+
+        self.license_button = QPushButton("Scan for License Keys", self)
+        self.license_button.setToolTip("Scan your system for software license keys and save a report.")
+        self.license_button.clicked.connect(self.scan_for_license_keys)
+        self.license_button.setFixedSize(180, 42)
+        layout.addWidget(self.license_button, action_row, 2)
+
+        # Add Select Users for Backup button below main action buttons
+        self.selected_users = []  # List of user names selected for backup
+        select_users_row = action_row + 1
+        self.select_users_button = QPushButton("Select User(s) for Backup", self)
+        self.select_users_button.setToolTip("Scan for user folders and select one or more for backup. Attempts to take ownership if needed.")
+        self.select_users_button.clicked.connect(self.select_users_for_backup)
+        self.select_users_button.setFixedSize(220, 42)
+        layout.addWidget(self.select_users_button, select_users_row, 0, 1, cols)
+
+        # Add a flexible spacer row below buttons to keep them top-aligned
+        total_rows = 1 + ((len(self.backup_sources) + cols - 1) // cols)  # header + button rows
+        layout.setRowStretch(total_rows + 1, 1)
+        layout.addItem(QSpacerItem(0, 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding),
+               total_rows + 1, 0, 1, cols)
+
+        # Auto-refresh timer every 5 seconds to re-check sources
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.check_source_folders)
+        self.refresh_timer.start(5000)
+    def select_users_for_backup(self):
+        from PySide6.QtWidgets import QMessageBox, QDialog, QVBoxLayout, QListWidget, QPushButton, QAbstractItemView, QFileDialog
+        import getpass
+        import os
+        import shutil
+        user_root = os.path.expandvars(r"C:\Users") if sys.platform.startswith("win") else "/Users"
+        current_user = getpass.getuser()
+        # List user directories
+        try:
+            user_dirs = [d for d in os.listdir(user_root) if os.path.isdir(os.path.join(user_root, d))]
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to list user directories: {e}")
+            return
+        if not user_dirs:
+            QMessageBox.information(self, "No Users", "No user directories found.")
+            return
+        # Multi-select dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select User(s) for Backup")
+        vbox = QVBoxLayout(dlg)
+        listw = QListWidget(dlg)
+        listw.addItems(user_dirs)
+        listw.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        vbox.addWidget(listw)
+        ok_btn = QPushButton("OK", dlg)
+        ok_btn.clicked.connect(dlg.accept)
+        vbox.addWidget(ok_btn)
+        dlg.setMinimumWidth(350)
+        if not dlg.exec():
+            return
+        selected = [item.text() for item in listw.selectedItems()]
+        if not selected:
+            return
+        self.selected_users = selected
+        # Ask for backup location if not set
+        backup_location = self.backup_location
+        if not backup_location:
+            backup_location = QFileDialog.getExistingDirectory(self, "Select Backup Location")
+            if not backup_location:
+                QMessageBox.warning(self, "Error", "No backup location selected.")
+                return
+            self.backup_location = backup_location
+        # For each selected user, if not current, try to take ownership and copy
+        for user in selected:
+            user_path = os.path.join(user_root, user)
+            if not os.path.exists(user_path):
+                continue
+            # Try to take ownership if not current user
+            if user != current_user:
+                if sys.platform.startswith("win"):
+                    import subprocess
+                    try:
+                        takeown_cmd = ["takeown", "/f", user_path, "/r", "/d", "y"]
+                        icacls_cmd = ["icacls", user_path, "/grant", f"{current_user}:F", "/t", "/c"]
+                        subprocess.run(takeown_cmd, check=True, capture_output=True, shell=True)
+                        subprocess.run(icacls_cmd, check=True, capture_output=True, shell=True)
+                    except Exception as e:
+                        res = QMessageBox.question(self, "Permission Error", f"Failed to take ownership of {user_path}: {e}\nContinue anyway?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                        if res != QMessageBox.StandardButton.Yes:
+                            continue
+                else:
+                    import subprocess
+                    try:
+                        subprocess.run(["sudo", "chown", "-R", current_user, user_path], check=True)
+                        subprocess.run(["sudo", "chmod", "-R", "u+rwX", user_path], check=True)
+                    except Exception as e:
+                        res = QMessageBox.question(self, "Permission Error", f"Failed to take ownership of {user_path}: {e}\nContinue anyway?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                        if res != QMessageBox.StandardButton.Yes:
+                            continue
+            # Copy user folder to backup location, preserving folder name
+            dest_path = os.path.join(backup_location, user)
+            try:
+                if os.path.exists(dest_path):
+                    shutil.rmtree(dest_path)
+                shutil.copytree(user_path, dest_path)
+            except Exception as e:
+                QMessageBox.warning(self, "Backup Error", f"Failed to backup {user}: {e}")
+                continue
+        QMessageBox.information(self, "Done", f"Selected user folders have been backed up to {backup_location}.")
+
+
+    def organize_directory(self):
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        import os, shutil
+        # Prompt user for directory
+        path = QFileDialog.getExistingDirectory(self, "Select Directory to Organize")
+        if not path:
+            return
+        # Confirm with the user before proceeding
+        confirm = QMessageBox.question(self, "Confirm Organize", f"Are you sure you want to organize all files in:\n{path}\n? This will move files into subfolders by extension.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Error", "The specified directory does not exist.")
+            return
+        files = os.listdir(path)
+        moved_count = 0
+        for file in files:
+            file_path = os.path.join(path, file)
+            if os.path.isdir(file_path):
+                continue
+            filename, extension = os.path.splitext(file)
+            extension = extension[1:] if extension else "NoExtension"
+            dest_folder = os.path.join(path, extension)
+            if not os.path.exists(dest_folder):
+                os.makedirs(dest_folder)
+            dest_file_path = os.path.join(dest_folder, file)
+            counter = 1
+            while os.path.exists(dest_file_path):
+                if extension != "NoExtension":
+                    new_filename = f"{filename}{counter}.{extension}"
+                else:
+                    new_filename = f"{filename}_{counter}"
+                dest_file_path = os.path.join(dest_folder, new_filename)
+                counter += 1
+            shutil.move(file_path, dest_file_path)
+            moved_count += 1
+        QMessageBox.information(self, "Organize Directory", f"Moved {moved_count} files into subfolders by extension.")
+    def setup_dedupe_table(self, layout, row, cols):
+        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QAbstractItemView
+        self.dedupe_table = QTableWidget(self)
+        self.dedupe_table.setColumnCount(2)
+        self.dedupe_table.setHorizontalHeaderLabels(["Hash", "File Path"])
+        self.dedupe_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.dedupe_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.dedupe_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        layout.addWidget(self.dedupe_table, row, 0, 1, cols)
+        self.dedupe_table.hide()
+    def scan_for_license_keys(self):
+        all_data = {}
+        if sys.platform.startswith("win"):
+            all_data = self.scan_windows_registry()
+        elif sys.platform.startswith("darwin"):
+            if plistlib is None:
+                QMessageBox.warning(self, "Error", "plistlib not available on this system.")
+                return
+            all_data = self.scan_macos_plists()
+        else:
+            QMessageBox.warning(self, "Error", "Unsupported platform for license key scan.")
+            return
+
+        if all_data:
+            # Ask user where to save
+            save_path, _ = QFileDialog.getSaveFileName(self, "Save License Keys Report", "licenses.json", "JSON Files (*.json);;All Files (*)")
+            if not save_path:
+                return
+            def default_serializer(obj):
+                try:
+                    import datetime
+                    if isinstance(obj, datetime.datetime) or isinstance(obj, datetime.date):
+                        return obj.isoformat()
+                except Exception:
+                    pass
+                return str(obj)
+            with open(save_path, "w") as f:
+                json.dump(all_data, f, indent=4, default=default_serializer)
+            QMessageBox.information(self, "Done", f"License keys saved to {save_path}")
+        else:
+            QMessageBox.information(self, "No Keys Found", "No license keys found or unsupported platform.")
+
+    def scan_windows_registry(self):
+        if not winreg:
+            return {}
+        registry_paths = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wow6432Node\Microsoft\Windows NT\CurrentVersion"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE"),
+        ]
+        results = {}
+        for hive, path in registry_paths:
+            try:
+                reg_key = winreg.OpenKey(hive, path)
+                i = 0
+                while True:
+                    try:
+                        name, value, _ = winreg.EnumValue(reg_key, i)
+                        if self.is_license_key(name, value):
+                            results[f"{path}\\{name}"] = value
+                        i += 1
+                    except OSError:
+                        break
+                winreg.CloseKey(reg_key)
+            except FileNotFoundError:
+                continue
+        return results
+
+    def is_license_key(self, name, value):
+        if isinstance(value, str):
+            license_pattern = r"[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}"
+            if "key" in name.lower() or "license" in name.lower() or re.search(license_pattern, value):
+                return True
+        return False
+
+    def scan_macos_plists(self):
+        results = {}
+        search_paths = ["/Library/Preferences", os.path.expanduser("~/Library/Preferences")]
+        for path in search_paths:
+            if os.path.exists(path):
+                for file in os.listdir(path):
+                    if file.endswith(".plist"):
+                        file_path = os.path.join(path, file)
+                        try:
+                            with open(file_path, "rb") as f:
+                                data = plistlib.load(f)
+                                for k, v in data.items():
+                                    if self.is_license_key(str(k), str(v)):
+                                        results[f"{file}:{k}"] = v
+                        except Exception:
+                            continue
+        return results
 
     def setup_keep_screen_on(self, layout, row, cols):
         from PySide6.QtWidgets import QCheckBox, QLabel
@@ -128,7 +452,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Windows Backup Application")
+        self.setWindowTitle("S.A.K. Utility")
         self.setFixedSize(800, 600)
         self.backup_location = ""
 
@@ -146,19 +470,18 @@ class MainWindow(QMainWindow):
             layout.setColumnStretch(c, 1)
         # -------------------------------------------------
 
-        # Add Keep Screen On checkbox at the top
-        self.setup_keep_screen_on(layout, 1, cols)
 
-        # Set Backup Location Button (spans top row)
+        # Add Keep Screen On checkbox at the top
+        self.setup_keep_screen_on(layout, 8, cols)
+
+        # Add Dedupe Table (hidden by default, shown after scan)
+        self.setup_dedupe_table(layout, 9, cols)
+
+        # Set Backup Location Button (top row)
         self.backup_location_button = QPushButton("Set Backup Location", self)
+        self.backup_location_button.setToolTip("Choose the folder where backups will be stored.")
         self.backup_location_button.clicked.connect(self.set_backup_location)
         layout.addWidget(self.backup_location_button, 0, 0, 1, cols)
-        
-        # De-Duplicate Button (next to backup location button)
-        self.dedup_button = QPushButton("De-Duplicate", self)
-        self.dedup_button.clicked.connect(self.run_deduplication)
-        layout.addWidget(self.dedup_button, 0, 0, 7, cols)
-        self.dedup_button.setFixedSize(180, 42)
 
         # Map buttons to (source path, patterns, destination name)
         self.backup_sources = {
@@ -177,16 +500,46 @@ class MainWindow(QMainWindow):
         self.backup_buttons = []
         for idx, (name, (src, pats, dest)) in enumerate(self.backup_sources.items()):
             btn = self.create_button(name, lambda checked=False, n=name: self.start_backup(*self.backup_sources[n]))
+            btn.setToolTip(f"Backup all files from {src} to your backup location as '{dest}'.")
             btn.setFixedSize(180, 42)
             btn.setEnabled(False)
             self.backup_buttons.append((btn, name))
 
             # --- Correct grid placement (fixes orientation/alignment) ---
-            row = 2 + (idx // cols)      # first row after the header
-            col = idx % cols             # 0, 1, 0, 1, ...
+            row = 1 + (idx // cols)      # first row after the header
+            col = idx % cols             # 0, 1, 2, ...
             layout.addWidget(btn, row, col)
             # ------------------------------------------------------------
 
+        # Place Organize, De-Duplicate, and Scan License Keys buttons in a new row below backup buttons, with a blank row in between
+        action_row = 2 + ((len(self.backup_sources) + cols - 1) // cols)
+        # Add a blank spacer row (no widgets added to row action_row - 1)
+        self.organize_button = QPushButton("Organize Directory", self)
+        self.organize_button.setToolTip("Organize all files in a selected directory into subfolders by file extension.")
+        self.organize_button.clicked.connect(self.organize_directory)
+        self.organize_button.setFixedSize(180, 42)
+        layout.addWidget(self.organize_button, action_row, 0)
+
+        self.dedup_button = QPushButton("De-Duplicate", self)
+        self.dedup_button.setToolTip("Scan a folder for duplicate files and take action on them.")
+        self.dedup_button.clicked.connect(self.run_deduplication)
+        self.dedup_button.setFixedSize(180, 42)
+        layout.addWidget(self.dedup_button, action_row, 1)
+
+        self.license_button = QPushButton("Scan for License Keys", self)
+        self.license_button.setToolTip("Scan your system for software license keys and save a report.")
+        self.license_button.clicked.connect(self.scan_for_license_keys)
+        self.license_button.setFixedSize(180, 42)
+        layout.addWidget(self.license_button, action_row, 2)
+
+        # Add Select Users for Backup button below main action buttons
+        self.selected_users = []  # List of user names selected for backup
+        select_users_row = action_row + 1
+        self.select_users_button = QPushButton("Select User(s) for Backup", self)
+        self.select_users_button.setToolTip("Scan for user folders and select one or more for backup. Attempts to take ownership if needed.")
+        self.select_users_button.clicked.connect(self.select_users_for_backup)
+        self.select_users_button.setFixedSize(220, 42)
+        layout.addWidget(self.select_users_button, select_users_row, 0, 1, cols)
         # Add a flexible spacer row below buttons to keep them top-aligned
         total_rows = 1 + ((len(self.backup_sources) + cols - 1) // cols)  # header + button rows
         layout.setRowStretch(total_rows + 1, 1)
@@ -210,6 +563,7 @@ class MainWindow(QMainWindow):
             self.check_source_folders()
             
     def run_deduplication(self):
+        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QDialog, QVBoxLayout, QMessageBox, QPushButton
         # Use QFileDialog to select directory to scan
         directory = QFileDialog.getExistingDirectory(self, "Select Directory to Scan for Duplicates")
         if not directory:
@@ -224,13 +578,34 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "De-Duplicate", "No duplicates found.")
             return
 
-        # Show a simple report dialog
-        msg = "Duplicates found:\n"
-        for _, paths in duplicates.items():
-            msg += "\n".join(paths) + "\n------\n"
-        QMessageBox.information(self, "Duplicates Found", msg)
+        # Show results in a separate dialog window
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Duplicate Files Found")
+        dialog.setMinimumSize(700, 400)
+        vbox = QVBoxLayout(dialog)
+        table = QTableWidget(dialog)
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Hash", "File Path"])
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        table.verticalHeader().setVisible(False)
+        table.setRowCount(0)
+        for hash_val, paths in duplicates.items():
+            for path in paths:
+                row = table.rowCount()
+                table.insertRow(row)
+                table.setItem(row, 0, QTableWidgetItem(hash_val))
+                table.setItem(row, 1, QTableWidgetItem(path))
+        table.resizeColumnsToContents()
+        vbox.addWidget(table)
+        # Add a close button
+        close_btn = QPushButton("Close", dialog)
+        close_btn.clicked.connect(dialog.accept)
+        vbox.addWidget(close_btn)
+        dialog.exec()
 
-        # Ask user for action using a dialog
+        # After dialog is closed, show the action dialog
         action_box = QMessageBox(self)
         action_box.setWindowTitle("Choose Action")
         action_box.setText("What would you like to do with the duplicates?")
@@ -241,7 +616,6 @@ class MainWindow(QMainWindow):
         action_box.exec()
         clicked = action_box.clickedButton()
         if clicked == delete_btn:
-            # Delete duplicates (keep first file)
             for _, paths in duplicates.items():
                 for path in paths[1:]:
                     try:
@@ -250,7 +624,6 @@ class MainWindow(QMainWindow):
                         QMessageBox.warning(self, "Delete Error", f"Failed to delete {path}: {e}")
             QMessageBox.information(self, "Done", "Duplicates deleted.")
         elif clicked == move_btn:
-            # Ask for target directory
             target_dir = QFileDialog.getExistingDirectory(self, "Select Directory to Move Duplicates To")
             if not target_dir:
                 return
@@ -263,7 +636,6 @@ class MainWindow(QMainWindow):
                         QMessageBox.warning(self, "Move Error", f"Failed to move {path}: {e}")
             QMessageBox.information(self, "Done", "Duplicates moved.")
         elif clicked == report_btn:
-            # Ask for report file path
             report_path, _ = QFileDialog.getSaveFileName(self, "Save Duplicates Report", "duplicates_report.json", "JSON Files (*.json);;All Files (*)")
             if not report_path:
                 return
@@ -332,32 +704,35 @@ class MainWindow(QMainWindow):
                 else:
                     btn.setToolTip(f"No files found in {src} to backup")
 
+
     def start_backup(self, source_dir, patterns, destination_name):
-        if not self.backup_location:
-            QMessageBox.warning(self, "Error", "Please set a backup location first.")
-            return
-
-        if not os.path.exists(source_dir):
-            QMessageBox.warning(self, "Error", f"Source folder not found: {source_dir}")
-            return
-
-        destination_root = os.path.join(self.backup_location, destination_name)
-        os.makedirs(destination_root, exist_ok=True)
-
-        self.progress_dialog = QProgressDialog(f"Backing up {destination_name}...", "Cancel", 0, 100, self)
-        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress_dialog.setMinimumWidth(420)
-        self.progress_dialog.setValue(0)
-
-        self.worker = BackupWorker(source_dir, destination_root, patterns)
-        self.worker.progress_update.connect(self.update_progress)
-        self.worker.finished.connect(self.backup_finished)
-        self.progress_dialog.canceled.connect(self.worker.cancel)
-
-        total_files, _ = self.worker.count_files()
-        self.progress_dialog.setMaximum(total_files if total_files > 0 else 1)
-
-        self.worker.start()
+        import getpass
+        import os
+        from PySide6.QtWidgets import QProgressDialog, QMessageBox
+        user_root = os.path.expandvars(r"C:\Users") if sys.platform.startswith("win") else "/Users"
+        current_user = getpass.getuser()
+        users = self.selected_users if self.selected_users else [current_user]
+        for user in users:
+            user_source_dir = source_dir.replace(get_user_path(), os.path.join(user_root, user))
+            if not self.backup_location:
+                QMessageBox.warning(self, "Error", "Please set a backup location first.")
+                return
+            if not os.path.exists(user_source_dir):
+                QMessageBox.warning(self, "Error", f"Source folder not found: {user_source_dir}")
+                continue
+            destination_root = os.path.join(self.backup_location, user, destination_name)
+            os.makedirs(destination_root, exist_ok=True)
+            self.progress_dialog = QProgressDialog(f"Backing up {destination_name} for {user}...", "Cancel", 0, 100, self)
+            self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            self.progress_dialog.setMinimumWidth(420)
+            self.progress_dialog.setValue(0)
+            self.worker = BackupWorker(user_source_dir, destination_root, patterns)
+            self.worker.progress_update.connect(self.update_progress)
+            self.worker.finished.connect(self.backup_finished)
+            self.progress_dialog.canceled.connect(self.worker.cancel)
+            total_files, _ = self.worker.count_files()
+            self.progress_dialog.setMaximum(total_files if total_files > 0 else 1)
+            self.worker.start()
 
     def update_progress(self, value, filename, file_size, copied_size, speed):
         copied_mb = copied_size / (1024 * 1024)
