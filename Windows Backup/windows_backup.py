@@ -780,148 +780,181 @@ class MainWindow(QMainWindow):
         report_btn = action_box.addButton("Save Report", QMessageBox.ButtonRole.ActionRole)
         cancel_btn = action_box.addButton(QMessageBox.StandardButton.Cancel)
         action_box.exec()
+
+        log_file = new_log_file(directory, "dedupe")
         clicked = action_box.clickedButton()
         if clicked == delete_btn:
+            total_deleted = 0
             for _, paths in duplicates.items():
                 for path in paths[1:]:
                     try:
                         os.remove(path)
+                        total_deleted += 1
+                        log_line(log_file, f"DELETED {path}")
                     except Exception as e:
-                        QMessageBox.warning(self, "Delete Error", f"Failed to delete {path}: {e}")
-            QMessageBox.information(self, "Done", "Duplicates deleted.")
+                        log_line(log_file, f"ERROR deleting {path}: {e}")
+            QMessageBox.information(self, "Done", f"Duplicates deleted: {total_deleted}\nLog: {log_file}")
         elif clicked == move_btn:
             target_dir = QFileDialog.getExistingDirectory(self, "Select Directory to Move Duplicates To")
             if not target_dir:
                 return
+            moved = 0
             for _, paths in duplicates.items():
                 for path in paths[1:]:
                     try:
-                        target_path = os.path.join(target_dir, os.path.basename(path))
+                        base = os.path.basename(path)
+                        target_path = os.path.join(target_dir, base)
+                        if os.path.exists(target_path):
+                            stem, ext = os.path.splitext(base)
+                            counter = 1
+                            while os.path.exists(target_path):
+                                target_path = os.path.join(target_dir, f"{stem}_{counter}{ext}")
+                                counter += 1
                         os.rename(path, target_path)
+                        moved += 1
+                        log_line(log_file, f"MOVED {path} -> {target_path}")
                     except Exception as e:
-                        QMessageBox.warning(self, "Move Error", f"Failed to move {path}: {e}")
-            QMessageBox.information(self, "Done", "Duplicates moved.")
+                        log_line(log_file, f"ERROR moving {path}: {e}")
+            QMessageBox.information(self, "Done", f"Duplicates moved: {moved}\nDestination: {target_dir}\nLog: {log_file}")
         elif clicked == report_btn:
             report_path, _ = QFileDialog.getSaveFileName(self, "Save Duplicates Report", "duplicates_report.json", "JSON Files (*.json);;All Files (*)")
             if not report_path:
                 return
             self.generate_report(duplicates, report_path)
-            QMessageBox.information(self, "Done", f"Report saved to {report_path}")
+            log_line(log_file, f"REPORT saved to {report_path}")
+            QMessageBox.information(self, "Done", f"Report saved to {report_path}\nLog: {log_file}")
         else:
             QMessageBox.information(self, "No Action", "No action taken.")
 
-
-    def get_file_hash(self, filepath):
-        """Return the MD5 hash of a file."""
-        hasher = hashlib.md5()
-        with open(filepath, 'rb') as f:
-            buf = f.read()
-            hasher.update(buf)
-        return hasher.hexdigest()
-
     def find_duplicates(self, directory, min_size=0, file_extensions=None):
-        """Find duplicate files in a directory, with optional file type filtering."""
         hashes = {}
         duplicates = {}
-        for dirpath, dirnames, filenames in os.walk(directory):
+        visited = set()
+        for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+            real_dir = os.path.realpath(dirpath)
+            if real_dir in visited:
+                continue
+            visited.add(real_dir)
             for filename in filenames:
                 if file_extensions and not filename.lower().endswith(tuple(file_extensions)):
-                    continue  # Skip files that don't match the extensions
-
+                    continue
                 filepath = os.path.join(dirpath, filename)
-                if os.path.getsize(filepath) >= min_size:
-                    file_hash = self.get_file_hash(filepath)
-                    if file_hash in hashes:
-                        duplicates.setdefault(file_hash, []).append(filepath)
-                        # Also ensure the original file is in the duplicates list
-                        if hashes[file_hash] not in duplicates[file_hash]:
-                            duplicates[file_hash].append(hashes[file_hash])
-                    else:
-                        hashes[file_hash] = filepath
-
-        return {k: v for k, v in duplicates.items() if len(v) > 1}
-    
-    
-    def generate_report(self, duplicates, report_path):
-        """Generate a report of duplicate files in JSON format."""
-        with open(report_path, 'w') as report_file:
-            json.dump(duplicates, report_file, indent=4)
-        print(f"Report generated: {report_path}")
-
-    def check_source_folders(self):
-        """Enable buttons only if source exists and has files; set tooltips if disabled"""
-        for btn, name in self.backup_buttons:
-            src, patterns, dest = self.backup_sources[name]
-            folder_exists = os.path.exists(src)
-            has_files = folder_exists and any(
-                any(f.lower().endswith(p.lstrip("*").lower()) for f in files for p in patterns)
-                for _, _, files in os.walk(src)
-            )
-
-            if folder_exists and has_files:
-                if not btn.isEnabled():
-                    btn.setEnabled(True)
-                btn.setToolTip(f"Backup files from {src} → {dest}")
-            else:
-                if btn.isEnabled():
-                    btn.setEnabled(False)
-                if not folder_exists:
-                    btn.setToolTip(f"Source folder not found: {src}")
+                try:
+                    size_ok = os.path.getsize(filepath) >= min_size
+                except Exception:
+                    size_ok = False
+                if not size_ok:
+                    continue
+                try:
+                    file_hash = chunked_file_hash(filepath)
+                except Exception:
+                    continue
+                if file_hash in hashes:
+                    duplicates.setdefault(file_hash, []).append(filepath)
+                    if hashes[file_hash] not in duplicates[file_hash]:
+                        duplicates[file_hash].append(hashes[file_hash])
                 else:
-                    btn.setToolTip(f"No files found in {src} to backup")
+                    hashes[file_hash] = filepath
+        return {k: v for k, v in duplicates.items() if len(v) > 1}
+
+    def generate_report(self, duplicates, report_path):
+        with open(report_path, 'w', encoding='utf-8') as report_file:
+            json.dump(duplicates, report_file, indent=4)
+
+    # ------------------------------------------------------------------
+    # License keys scanning (uses LicenseScanWorker, elevation prompt on Windows)
+    # ------------------------------------------------------------------
+    def scan_for_license_keys(self):
+        # If Windows, check admin and offer elevation
+        if sys.platform.startswith('win'):
+            if not self._is_user_admin():
+                resp = QMessageBox.question(
+                    self,
+                    "Administrator Privileges Required",
+                    "Scanning the registry works best with administrator rights.\n\nRestart this app as Administrator now?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if resp == QMessageBox.StandardButton.Yes:
+                    self._restart_as_admin()
+                    return  # Current process will continue only if elevation failed
+                # else continue without admin (limited scan)
+
+        # Start worker
+        root_for_logs = self.backup_location or os.getcwd()
+        self.lic_worker = LicenseScanWorker(root_for_logs)
+
+        # Progress dialog (we'll use total = number of root paths/files)
+        self.lic_prog = QProgressDialog("Scanning for license keys...", "Cancel", 0, 100, self)
+        self.lic_prog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.lic_prog.setAutoClose(False)
+        self.lic_prog.setAutoReset(False)
+        self.lic_prog.setMinimumDuration(0)
+        self.lic_prog.setValue(0)
+
+        def on_progress(done, total, label):
+            total = max(1, total)
+            pct = int((done / total) * 100)
+            pct = min(100, max(0, pct))
+            self.lic_prog.setValue(pct)
+            self.lic_prog.setLabelText(f"{label} — {pct}%")
+
+        def on_finished(results: dict, log_file: str):
+            self.lic_prog.close()
+            if results:
+                # Offer to save report
+                save_path, _ = QFileDialog.getSaveFileName(self, "Save License Keys Report", "licenses.json", "JSON Files (*.json);;All Files (*)")
+                if save_path:
+                    with open(save_path, 'w', encoding='utf-8') as f:
+                        json.dump(results, f, indent=4)
+                QMessageBox.information(self, "License Scan Complete", f"Found {len(results)} potential keys.\nLog: {log_file}")
+            else:
+                QMessageBox.information(self, "License Scan Complete", f"No obvious license keys found.\nLog: {log_file}")
+
+        def on_failed(msg: str):
+            self.lic_prog.close()
+            QMessageBox.warning(self, "License Scan Failed", msg)
+
+        def on_cancel():
+            self.lic_worker.cancel()
+
+        self.lic_worker.progress.connect(on_progress)
+        self.lic_worker.finished.connect(on_finished)
+        self.lic_worker.failed.connect(on_failed)
+        self.lic_prog.canceled.connect(on_cancel)
+
+        self.lic_worker.start()
+        self.lic_prog.show()
+
+    # ---- Elevation helpers (Windows) ----
+    def _is_user_admin(self) -> bool:
+        if not sys.platform.startswith('win'):
+            return False
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    def _restart_as_admin(self):
+        try:
+            import ctypes, sys
+            params = ' '.join([f'"{a}"' for a in sys.argv])
+            # Attempt to relaunch the same interpreter with the same script and args
+            r = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+            if r <= 32:
+                QMessageBox.warning(self, "Elevation", "Failed to restart as Administrator. You can still run a limited scan.")
+            else:
+                # Successfully launched elevated instance; exit current
+                QApplication.instance().quit()
+        except Exception as e:
+            QMessageBox.warning(self, "Elevation", f"Could not request elevation: {e}")
 
 
-    def start_backup(self, source_dir, patterns, destination_name):
-        import getpass
-        import os
-        from PySide6.QtWidgets import QProgressDialog, QMessageBox
-        user_root = os.path.expandvars(r"C:\Users") if sys.platform.startswith("win") else "/Users"
-        current_user = getpass.getuser()
-        users = self.selected_users if self.selected_users else [current_user]
-        for user in users:
-            user_source_dir = source_dir.replace(get_user_path(), os.path.join(user_root, user))
-            if not self.backup_location:
-                QMessageBox.warning(self, "Error", "Please set a backup location first.")
-                return
-            if not os.path.exists(user_source_dir):
-                QMessageBox.warning(self, "Error", f"Source folder not found: {user_source_dir}")
-                continue
-            destination_root = os.path.join(self.backup_location, user, destination_name)
-            os.makedirs(destination_root, exist_ok=True)
-            self.progress_dialog = QProgressDialog(f"Backing up {destination_name} for {user}...", "Cancel", 0, 100, self)
-            self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-            self.progress_dialog.setMinimumWidth(420)
-            self.progress_dialog.setValue(0)
-            self.worker = BackupWorker(user_source_dir, destination_root, patterns)
-            self.worker.progress_update.connect(self.update_progress)
-            self.worker.finished.connect(self.backup_finished)
-            self.progress_dialog.canceled.connect(self.worker.cancel)
-            total_files, _ = self.worker.count_files()
-            self.progress_dialog.setMaximum(total_files if total_files > 0 else 1)
-            self.worker.start()
-
-    def update_progress(self, value, filename, file_size, copied_size, speed):
-        copied_mb = copied_size / (1024 * 1024)
-        total_mb = self.worker.total_size / (1024 * 1024) if self.worker.total_size else 0
-        speed_mb = speed / (1024 * 1024)
-        self.progress_dialog.setValue(value)
-        self.progress_dialog.setLabelText(
-            f"Copying: {filename}\n"
-            f"File size: {file_size / 1024:.1f} KB\n"
-            f"Copied: {copied_mb:.2f} / {total_mb:.2f} MB\n"
-            f"Speed: {speed_mb:.2f} MB/s"
-        )
-
-    def backup_finished(self, files_copied, success, message):
-        self.progress_dialog.close()
-        if success:
-            QMessageBox.information(self, "Success", f"{message}\n{files_copied} files backed up.")
-        else:
-            QMessageBox.warning(self, "Backup", message)
-
-
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    app.exec()
+    sys.exit(app.exec())
