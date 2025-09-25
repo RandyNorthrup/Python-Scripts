@@ -1,9 +1,11 @@
-import os, sys, shutil, time
+import os, sys, shutil, time, hashlib, datetime, json
 from PySide6.QtWidgets import (
     QMainWindow, QApplication, QPushButton, QWidget, QFileDialog, QMessageBox,
     QGridLayout, QProgressDialog, QSpacerItem, QSizePolicy
 )
+from PySide6.QtWidgets import QSizePolicy
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
+
 
 
 def get_user_path(subpath=""):
@@ -100,7 +102,7 @@ class MainWindow(QMainWindow):
         central_widget.setLayout(layout)
 
         # --- Alignment/spacing tweaks for clean layout ---
-        cols = 2
+        cols = 3
         layout.setHorizontalSpacing(12)
         layout.setVerticalSpacing(12)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -112,6 +114,12 @@ class MainWindow(QMainWindow):
         self.backup_location_button = QPushButton("Set Backup Location", self)
         self.backup_location_button.clicked.connect(self.set_backup_location)
         layout.addWidget(self.backup_location_button, 0, 0, 1, cols)
+        
+        # De-Duplicate Button (next to backup location button)
+        self.dedup_button = QPushButton("De-Duplicate", self)
+        self.dedup_button.clicked.connect(self.run_deduplication)
+        layout.addWidget(self.dedup_button, 0, 0, 7, cols)
+        self.dedup_button.setFixedSize(180, 42)
 
         # Map buttons to (source path, patterns, destination name)
         self.backup_sources = {
@@ -135,7 +143,7 @@ class MainWindow(QMainWindow):
             self.backup_buttons.append((btn, name))
 
             # --- Correct grid placement (fixes orientation/alignment) ---
-            row = 1 + (idx // cols)      # first row after the header
+            row = 2 + (idx // cols)      # first row after the header
             col = idx % cols             # 0, 1, 0, 1, ...
             layout.addWidget(btn, row, col)
             # ------------------------------------------------------------
@@ -143,8 +151,8 @@ class MainWindow(QMainWindow):
         # Add a flexible spacer row below buttons to keep them top-aligned
         total_rows = 1 + ((len(self.backup_sources) + cols - 1) // cols)  # header + button rows
         layout.setRowStretch(total_rows + 1, 1)
-        layout.addItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding),
-                       total_rows + 1, 0, 1, cols)
+        layout.addItem(QSpacerItem(0, 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding),
+               total_rows + 1, 0, 1, cols)
 
         # Auto-refresh timer every 5 seconds to re-check sources
         self.refresh_timer = QTimer(self)
@@ -161,6 +169,107 @@ class MainWindow(QMainWindow):
         if folder:
             self.backup_location = folder
             self.check_source_folders()
+            
+    def run_deduplication(self):
+        # Use QFileDialog to select directory to scan
+        directory = QFileDialog.getExistingDirectory(self, "Select Directory to Scan for Duplicates")
+        if not directory:
+            return  # User cancelled
+
+        # For now, use default values for min_size and file_extensions
+        min_size = 0
+        file_extensions = None
+
+        duplicates = self.find_duplicates(directory, min_size, file_extensions)
+        if not duplicates:
+            QMessageBox.information(self, "De-Duplicate", "No duplicates found.")
+            return
+
+        # Show a simple report dialog
+        msg = "Duplicates found:\n"
+        for _, paths in duplicates.items():
+            msg += "\n".join(paths) + "\n------\n"
+        QMessageBox.information(self, "Duplicates Found", msg)
+
+        # Ask user for action using a dialog
+        action_box = QMessageBox(self)
+        action_box.setWindowTitle("Choose Action")
+        action_box.setText("What would you like to do with the duplicates?")
+        delete_btn = action_box.addButton("Delete Duplicates", QMessageBox.ButtonRole.AcceptRole)
+        move_btn = action_box.addButton("Move Duplicates", QMessageBox.ButtonRole.ActionRole)
+        report_btn = action_box.addButton("Save Report", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = action_box.addButton(QMessageBox.StandardButton.Cancel)
+        action_box.exec()
+        clicked = action_box.clickedButton()
+        if clicked == delete_btn:
+            # Delete duplicates (keep first file)
+            for _, paths in duplicates.items():
+                for path in paths[1:]:
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        QMessageBox.warning(self, "Delete Error", f"Failed to delete {path}: {e}")
+            QMessageBox.information(self, "Done", "Duplicates deleted.")
+        elif clicked == move_btn:
+            # Ask for target directory
+            target_dir = QFileDialog.getExistingDirectory(self, "Select Directory to Move Duplicates To")
+            if not target_dir:
+                return
+            for _, paths in duplicates.items():
+                for path in paths[1:]:
+                    try:
+                        target_path = os.path.join(target_dir, os.path.basename(path))
+                        os.rename(path, target_path)
+                    except Exception as e:
+                        QMessageBox.warning(self, "Move Error", f"Failed to move {path}: {e}")
+            QMessageBox.information(self, "Done", "Duplicates moved.")
+        elif clicked == report_btn:
+            # Ask for report file path
+            report_path, _ = QFileDialog.getSaveFileName(self, "Save Duplicates Report", "duplicates_report.json", "JSON Files (*.json);;All Files (*)")
+            if not report_path:
+                return
+            self.generate_report(duplicates, report_path)
+            QMessageBox.information(self, "Done", f"Report saved to {report_path}")
+        else:
+            QMessageBox.information(self, "No Action", "No action taken.")
+
+
+    def get_file_hash(self, filepath):
+        """Return the MD5 hash of a file."""
+        hasher = hashlib.md5()
+        with open(filepath, 'rb') as f:
+            buf = f.read()
+            hasher.update(buf)
+        return hasher.hexdigest()
+
+    def find_duplicates(self, directory, min_size=0, file_extensions=None):
+        """Find duplicate files in a directory, with optional file type filtering."""
+        hashes = {}
+        duplicates = {}
+        for dirpath, dirnames, filenames in os.walk(directory):
+            for filename in filenames:
+                if file_extensions and not filename.lower().endswith(tuple(file_extensions)):
+                    continue  # Skip files that don't match the extensions
+
+                filepath = os.path.join(dirpath, filename)
+                if os.path.getsize(filepath) >= min_size:
+                    file_hash = self.get_file_hash(filepath)
+                    if file_hash in hashes:
+                        duplicates.setdefault(file_hash, []).append(filepath)
+                        # Also ensure the original file is in the duplicates list
+                        if hashes[file_hash] not in duplicates[file_hash]:
+                            duplicates[file_hash].append(hashes[file_hash])
+                    else:
+                        hashes[file_hash] = filepath
+
+        return {k: v for k, v in duplicates.items() if len(v) > 1}
+    
+    
+    def generate_report(self, duplicates, report_path):
+        """Generate a report of duplicate files in JSON format."""
+        with open(report_path, 'w') as report_file:
+            json.dump(duplicates, report_file, indent=4)
+        print(f"Report generated: {report_path}")
 
     def check_source_folders(self):
         """Enable buttons only if source exists and has files; set tooltips if disabled"""
@@ -197,7 +306,7 @@ class MainWindow(QMainWindow):
         os.makedirs(destination_root, exist_ok=True)
 
         self.progress_dialog = QProgressDialog(f"Backing up {destination_name}...", "Cancel", 0, 100, self)
-        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self.progress_dialog.setMinimumWidth(420)
         self.progress_dialog.setValue(0)
 
