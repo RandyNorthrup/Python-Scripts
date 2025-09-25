@@ -1,14 +1,16 @@
 # PNG to Icon Converter (GUI)
 
-A simple Python GUI tool to convert PNG images into icon formats for Windows (.ico), macOS (.icns), and Linux (multiple PNG sizes). Built with PySide6 and Pillow.
+A simple Python GUI tool to convert PNG and SVG images into icon formats for Windows (.ico), macOS (.icns), and Linux (multiple PNG sizes). Built with PySide6, Pillow, and CairoSVG.
 
 ---
 
+
 ## Features
-- 🖼️ Select a PNG file and convert it to:
-  - Windows .ico (16x16, 32x32, 48x48, 256x256)
+- 🖼️ Select a PNG or SVG file and convert it to:
+  - Windows .ico (user-selectable sizes)
   - macOS .icns
-  - Linux PNG icons (16x16 up to 512x512)
+  - Linux PNG icons (user-selectable sizes)
+- ☑️ Checkboxes to select which icon sizes to output
 - 📂 Choose output directory
 - ⚡ Fast, one-click conversion
 - ❌ Error handling with pop-up dialogs
@@ -17,13 +19,15 @@ A simple Python GUI tool to convert PNG images into icon formats for Windows (.i
 
 ## Requirements
 
+
 - Python 3.8+
 - PySide6
 - Pillow
+- CairoSVG (for SVG support)
 
 Install dependencies:
 ```bash
-pip install PySide6 Pillow
+pip install PySide6 Pillow cairosvg
 ```
 
 ---
@@ -35,9 +39,9 @@ pip install PySide6 Pillow
    python png2icon.py
    ```
 2. Click **"Select PNG and Convert"**
-3. Choose a PNG file
+3. Choose a PNG or SVG file
 4. Select a directory to save the icons
-5. Icons for Windows, macOS, and Linux will be created in the chosen folder
+5. Icons for Windows, macOS, and Linux will be created in the chosen folder, in the sizes you selected
 
 ---
 
