@@ -648,13 +648,12 @@ class MainWindow(QMainWindow):
                 table.setItem(row, 1, QTableWidgetItem(path))
         table.resizeColumnsToContents()
         vbox.addWidget(table)
-        # Add a close button
+
         close_btn = QPushButton("Close", dialog)
         close_btn.clicked.connect(dialog.accept)
         vbox.addWidget(close_btn)
         dialog.exec()
 
-        # After dialog is closed, show the action dialog
         action_box = QMessageBox(self)
         action_box.setWindowTitle("Choose Action")
         action_box.setText("What would you like to do with the duplicates?")
