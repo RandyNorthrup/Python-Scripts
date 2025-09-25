@@ -1,4 +1,4 @@
-# Windows Backup Application
+# Swiss Army Knife Utility
 
 A simple GUI tool for backing up important user folders (Contacts, Photos, Documents, Videos, Music, Desktop, Downloads) to a user-selected location on Windows.
 
