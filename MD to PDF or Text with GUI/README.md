@@ -108,3 +108,9 @@ You can add screenshots or a short screen recording here to make the README more
 
 ## License
 MIT License – free to use, modify, and share.
+
+---
+
+## Author
+
+Randy Northrup
