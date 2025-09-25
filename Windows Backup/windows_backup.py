@@ -1,6 +1,7 @@
-import re
+# -------------------- ALL IMPORTS AT TOP --------------------
 import sys
 import os
+import re
 import shutil
 import time
 import hashlib
@@ -10,12 +11,21 @@ import threading
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from PySide6.QtCore import QThread, Signal, Qt, QTimer
+from PySide6.QtWidgets import (
+    QMainWindow, QApplication, QPushButton, QWidget, QFileDialog, QMessageBox,
+    QGridLayout, QProgressDialog, QSpacerItem, QSizePolicy, QCheckBox,
+    QDialog, QVBoxLayout, QListWidget, QAbstractItemView, QTableWidget,
+    QTableWidgetItem, QLabel
+)
+
+# Optional stdlib
 try:
     import plistlib
 except ImportError:
     plistlib = None
 
-# Windows-specific imports
+# Windows-specific imports (optional)
 if sys.platform.startswith("win"):
     try:
         import winreg
@@ -30,23 +40,14 @@ try:
 except Exception:
     win32api = win32con = None
 
-from PySide6.QtWidgets import (
-    QMainWindow, QApplication, QPushButton, QWidget, QFileDialog, QMessageBox,
-    QGridLayout, QProgressDialog, QSpacerItem, QSizePolicy, QCheckBox,
-    QDialog, QVBoxLayout, QListWidget, QAbstractItemView, QTableWidget,
-    QTableWidgetItem, QLabel
-)
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
-
-# -----------------------------------------------------------------------------
-# Constants & helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Constants & Helpers
+# ---------------------------------------------------------------------------
 USER_ROOT = os.path.expandvars(r"C:\\Users") if sys.platform.startswith("win") else "/Users"
 TIMESTAMP_FMT = "%Y-%m-%d_%H-%M-%S"
 
 
 def ensure_logs_dir(root_dir: str) -> str:
-    """Create and return a _logs directory inside root_dir."""
     logs = os.path.join(root_dir, "_logs")
     os.makedirs(logs, exist_ok=True)
     return logs
@@ -54,8 +55,7 @@ def ensure_logs_dir(root_dir: str) -> str:
 
 def new_log_file(root_dir: str, prefix: str) -> str:
     ts = datetime.datetime.now().strftime(TIMESTAMP_FMT)
-    logs_dir = ensure_logs_dir(root_dir)
-    return os.path.join(logs_dir, f"{prefix}_{ts}.log")
+    return os.path.join(ensure_logs_dir(root_dir), f"{prefix}_{ts}.log")
 
 
 def log_line(path: str, text: str) -> None:
@@ -69,22 +69,134 @@ def log_line(path: str, text: str) -> None:
 def chunked_file_hash(filepath: str, chunk_size: int = 1024 * 1024) -> str:
     hasher = hashlib.md5()
     with open(filepath, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
+        for chunk in iter(lambda: f.read(chunk_size), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
 
 
-# -----------------------------------------------------------------------------
-# Backup worker thread (multithreaded copy inside)
-# -----------------------------------------------------------------------------
+def fast_scan(base_path: str):
+    """
+    Faster, stack-based directory traversal using os.scandir.
+    Yields (dir_path, [subdirs], [files]) without following symlinks.
+    """
+    stack = [base_path]
+    visited = set()
+    while stack:
+        path = stack.pop()
+        real = os.path.realpath(path)
+        if real in visited:
+            continue
+        visited.add(real)
+        try:
+            dirs, files = [], []
+            with os.scandir(path) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            dirs.append(entry.path)
+                        else:
+                            files.append(entry.path)
+                    except Exception:
+                        # Broken symlink or permission error on entry
+                        continue
+            yield path, dirs, files
+            stack.extend(dirs)
+        except Exception:
+            # Permission error on the directory itself – skip
+            continue
+
+
+# ---------------------------------------------------------------------------
+# PermissionUpdateWorker: set RW for all (files) and RWX for all (dirs)
+# ---------------------------------------------------------------------------
+class PermissionUpdateWorker(QThread):
+    progress = Signal(int, int, str)  # processed, total, current_path
+    finished = Signal(bool, str)      # success, message
+
+    def __init__(self, root_paths: list[str], log_file: str):
+        super().__init__()
+        self.root_paths = root_paths
+        self.log_file = log_file
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def _set_perms_posix(self, path: str, is_dir: bool):
+        # Read/write for everyone on files (0o666), and rwx on dirs (0o777) to allow traversal
+        mode = 0o777 if is_dir else 0o666
+        try:
+            os.chmod(path, mode)
+        except Exception as e:
+            log_line(self.log_file, f"PERM ERROR (chmod) {path}: {e}")
+
+    def _set_perms_windows(self, base: str):
+        """
+        On Windows, it's much faster and more reliable to grant at the root
+        using inheritance and let it cascade, than to call icacls per-item.
+        We still compute progress using a dry traversal for the progress bar.
+        """
+        try:
+            import subprocess
+            # Grant Everyone Modify with inheritance to files (OI) and subcontainers (CI)
+            subprocess.run(
+                ["icacls", base, "/grant", "Everyone:(OI)(CI)M", "/T", "/C"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            log_line(self.log_file, f"PERM WINDOWS ROOT-GRANT {base} -> Everyone:(OI)(CI)M (/T)")
+        except Exception as e:
+            log_line(self.log_file, f"PERM ERROR (icacls) {base}: {e}")
+
+    def run(self):
+        try:
+            # Build list of items for progress (count dirs + files)
+            all_items = []
+            for base in self.root_paths:
+                for root, dirs, files in fast_scan(base):
+                    all_items.append(root)
+                    all_items.extend(files)
+
+            total = len(all_items)
+            processed = 0
+
+            if sys.platform.startswith("win"):
+                # Apply grant at each selected root once (fast); then just "count through" for progress bar
+                for base in self.root_paths:
+                    self._set_perms_windows(base)
+
+                for path in all_items:
+                    if self._cancel:
+                        self.finished.emit(False, "Permission update cancelled.")
+                        return
+                    # progress only (inheritance already applied)
+                    processed += 1
+                    self.progress.emit(processed, total, path)
+
+            else:
+                # POSIX: set perms on every item (files 666, dirs 777)
+                for path in all_items:
+                    if self._cancel:
+                        self.finished.emit(False, "Permission update cancelled.")
+                        return
+                    self._set_perms_posix(path, is_dir=os.path.isdir(path))
+                    processed += 1
+                    self.progress.emit(processed, total, path)
+
+            self.finished.emit(True, f"Permissions updated for {len(self.root_paths)} top-level path(s).")
+        except Exception as e:
+            log_line(self.log_file, f"PERM FATAL: {e}")
+            self.finished.emit(False, f"Permission update failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# BackupWorker: threaded copy with optional MD5 verification
+# ---------------------------------------------------------------------------
 class BackupWorker(QThread):
     progress_update = Signal(int, str, int, int, float)  # files_processed, file, file_size, copied_size, speed
     finished = Signal(int, bool, str)  # files_copied, success, message
 
-    def __init__(self, source_dir: str, destination_root: str, patterns, log_file: str, max_workers: int | None = None):
+    def __init__(self, source_dir: str, destination_root: str, patterns, log_file: str,
+                 max_workers: int | None = None, verify_hash: bool = True):
         super().__init__()
         self.source_dir = source_dir
         self.destination_root = destination_root
@@ -95,28 +207,29 @@ class BackupWorker(QThread):
         self.copied_size = 0
         self.start_time = 0.0
         self.log_file = log_file
+        self.verify_hash = verify_hash
         self.max_workers = max_workers or max(2, min(8, (os.cpu_count() or 4) * 2))
         self._lock = threading.Lock()
 
+    def cancel(self):
+        self.cancelled = True
+
     def run(self):
         try:
-            # Build copy plan first (with symlink protection)
-            plan = []  # list of (src, dst, size)
-            visited = set()
-            total_size = 0.0
+            # Build plan
+            plan = []  # (src, dst, size)
+            total_size = 0
             total_files = 0
 
-            log_line(self.log_file, f"START Backup\n  Source: {self.source_dir}\n  DestRoot: {self.destination_root}")
+            log_line(self.log_file, f"START Backup\n  Source: {self.source_dir}\n  DestRoot: {self.destination_root}\n  Verify: {self.verify_hash}")
 
-            for root, dirs, files in os.walk(self.source_dir, followlinks=False):
-                real_root = os.path.realpath(root)
-                if real_root in visited:
-                    continue
-                visited.add(real_root)
-
+            for root, dirs, files in fast_scan(self.source_dir):
                 rel_path = os.path.relpath(root, self.source_dir)
                 dst_folder = os.path.join(self.destination_root, rel_path)
-                os.makedirs(dst_folder, exist_ok=True)
+                try:
+                    os.makedirs(dst_folder, exist_ok=True)
+                except Exception as e:
+                    log_line(self.log_file, f"MKDIR ERROR {dst_folder}: {e}")
 
                 for fname in files:
                     if not any(fname.lower().endswith(p.lstrip("*").lower()) or p == "*" for p in self.patterns):
@@ -124,14 +237,14 @@ class BackupWorker(QThread):
                     src = os.path.join(root, fname)
                     dst = os.path.join(dst_folder, fname)
                     try:
-                        fsize = float(os.path.getsize(src))
+                        fsize = os.path.getsize(src)
                     except Exception:
-                        fsize = 0.0
+                        fsize = 0
                     plan.append((src, dst, fsize))
                     total_files += 1
                     total_size += fsize
 
-            self.total_size = int(total_size)
+            self.total_size = total_size
             if total_files == 0:
                 msg = f"No files found to backup in: {self.source_dir}"
                 log_line(self.log_file, msg)
@@ -147,15 +260,19 @@ class BackupWorker(QThread):
                 try:
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.copy2(src, dst)
+                    if self.verify_hash:
+                        if chunked_file_hash(src) != chunked_file_hash(dst):
+                            log_line(self.log_file, f"HASH MISMATCH {src} -> {dst}")
+                            return False, src, dst, fsize, "hash mismatch"
                     with self._lock:
                         self.files_copied += 1
                         self.copied_size += int(fsize)
                         files_processed = self.files_copied
                         copied_size = self.copied_size
-                    log_line(self.log_file, f"COPIED {src} -> {dst} ({int(fsize)} bytes)")
                     elapsed = max(0.1, time.time() - self.start_time)
                     speed = copied_size / elapsed
                     self.progress_update.emit(files_processed, os.path.basename(src), int(fsize), copied_size, speed)
+                    log_line(self.log_file, f"COPIED {src} -> {dst} ({int(fsize)} bytes)")
                     return True, src, dst, fsize, None
                 except Exception as e:
                     log_line(self.log_file, f"ERROR copying {src} -> {dst}: {e}")
@@ -165,7 +282,7 @@ class BackupWorker(QThread):
             with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
                 futures = [pool.submit(copy_one, t) for t in plan]
                 for fut in as_completed(futures):
-                    ok, src, dst, fsize, err = fut.result()
+                    ok, _, _, _, err = fut.result()
                     if self.cancelled:
                         break
                     if not ok:
@@ -177,19 +294,17 @@ class BackupWorker(QThread):
             else:
                 summary = f"DONE. Files copied: {self.files_copied}; Errors: {errors}"
                 log_line(self.log_file, summary)
-                self.finished.emit(self.files_copied, errors == 0, "Backup completed successfully." if errors == 0 else summary)
+                self.finished.emit(self.files_copied, errors == 0,
+                                   "Backup completed successfully." if errors == 0 else summary)
 
         except Exception as e:
             log_line(self.log_file, f"FATAL: {e}")
             self.finished.emit(self.files_copied, False, f"Backup failed: {e}")
 
-    def cancel(self):
-        self.cancelled = True
 
-
-# -----------------------------------------------------------------------------
-# License scan worker (multi-threaded)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# LicenseScanWorker: Windows Registry + macOS plist recursive scanning
+# ---------------------------------------------------------------------------
 class LicenseScanWorker(QThread):
     progress = Signal(int, int, str)   # processed, total, label
     finished = Signal(dict, str)       # results, log_file
@@ -223,15 +338,12 @@ class LicenseScanWorker(QThread):
         if not winreg:
             return {}
 
-        # Expanded known paths
         targets = [
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wow6432Node\Microsoft\Windows NT\CurrentVersion"),
             (winreg.HKEY_CURRENT_USER,  r"SOFTWARE"),
-            # Common Office registration areas (may vary by version)
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Office"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wow6432Node\Microsoft\Office"),
-            # Uninstall (some apps store serials here)
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
         ]
@@ -240,6 +352,20 @@ class LicenseScanWorker(QThread):
         processed = 0
         results = {}
         pattern = re.compile(r"[A-Z0-9]{5}(?:-[A-Z0-9]{5}){4}")
+
+        def safe_tostr(value):
+            try:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="ignore")
+                return str(value)
+            except Exception:
+                return None
+
+        def looks_like_key(name: str, value: str) -> bool:
+            if not isinstance(value, str):
+                return False
+            nl = name.lower()
+            return ("key" in nl or "license" in nl or pattern.search(value) is not None)
 
         def scan_path(hive, subkey):
             found_local = {}
@@ -252,22 +378,17 @@ class LicenseScanWorker(QThread):
                     log_line(self.log_file, f"SKIP {key_path}: {e}")
                     continue
                 try:
-                    # Enumerate values
                     i = 0
                     while True and not self._cancel:
                         try:
                             name, value, vtype = winreg.EnumValue(reg, i)
-                            sval = self._safe_tostr(value)
-                            if sval is None:
-                                i += 1
-                                continue
-                            if self._looks_like_key(name, sval, pattern):
+                            sval = safe_tostr(value)
+                            if sval and looks_like_key(name, sval):
                                 found_local[f"{key_path}\\{name}"] = sval
                                 log_line(self.log_file, f"FOUND {key_path}\\{name} -> {sval}")
                             i += 1
                         except OSError:
                             break
-                    # Enumerate subkeys
                     j = 0
                     while True and not self._cancel:
                         try:
@@ -284,63 +405,63 @@ class LicenseScanWorker(QThread):
             return found_local
 
         with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4) * 2)) as pool:
-            futures = []
-            for hive, sub in targets:
-                futures.append(pool.submit(scan_path, hive, sub))
+            futures = [pool.submit(scan_path, hive, sub) for hive, sub in targets]
             for fut in as_completed(futures):
                 if self._cancel:
                     break
-                found = fut.result()
-                results.update(found)
+                results.update(fut.result())
                 processed += 1
                 self.progress.emit(processed, total, f"Windows Registry ({processed}/{total})")
 
         return results
 
-    @staticmethod
-    def _safe_tostr(value):
-        try:
-            if isinstance(value, bytes):
-                try:
-                    return value.decode('utf-8', errors='ignore')
-                except Exception:
-                    return None
-            return str(value)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _looks_like_key(name: str, value: str, regex) -> bool:
-        if not isinstance(value, str):
-            return False
-        nl = name.lower()
-        return ("key" in nl or "license" in nl or regex.search(value) is not None)
-
     # --------------------------- macOS ----------------------------
     def _scan_macos(self) -> dict:
+        if not plistlib:
+            return {}
+
         results = {}
         pattern = re.compile(r"[A-Z0-9]{5}(?:-[A-Z0-9]{5}){4}")
-        files = []
         search_paths = ["/Library/Preferences", os.path.expanduser("~/Library/Preferences")]
+        files = []
         for base in search_paths:
             if os.path.exists(base):
-                for f in os.listdir(base):
-                    if f.endswith('.plist'):
-                        files.append(os.path.join(base, f))
+                try:
+                    for f in os.listdir(base):
+                        if f.endswith(".plist"):
+                            files.append(os.path.join(base, f))
+                except Exception as e:
+                    log_line(self.log_file, f"LIST ERROR {base}: {e}")
 
         total = len(files)
         processed = 0
 
+        def looks_like_key(name: str, value: str) -> bool:
+            if not isinstance(value, str):
+                return False
+            nl = (name or "").lower()
+            return ("key" in nl or "license" in nl or pattern.search(value) is not None)
+
+        def flatten_items(obj, prefix=""):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    yield from flatten_items(v, f"{prefix}{k}.")
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj):
+                    yield from flatten_items(v, f"{prefix}{i}.")
+            else:
+                yield prefix[:-1], str(obj)
+
         def scan_one(path):
             local_found = {}
             try:
-                with open(path, 'rb') as fp:
+                with open(path, "rb") as fp:
                     data = plistlib.load(fp)
-                for k, v in (data or {}).items():
-                    sval = str(v)
-                    if self._looks_like_key(k, sval, pattern):
-                        local_found[f"{os.path.basename(path)}:{k}"] = sval
-                        log_line(self.log_file, f"FOUND {path}:{k} -> {sval}")
+                for k, v in flatten_items(data):
+                    if looks_like_key(k, v):
+                        key = f"{os.path.basename(path)}:{k}"
+                        local_found[key] = v
+                        log_line(self.log_file, f"FOUND {path}:{k} -> {v}")
             except Exception as e:
                 log_line(self.log_file, f"ERROR reading {path}: {e}")
             return local_found
@@ -357,21 +478,22 @@ class LicenseScanWorker(QThread):
         return results
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Main Window
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("S.A.K. Utility")
-        self.setFixedSize(900, 640)
+        self.setFixedSize(940, 700)
 
         # State
         self.backup_location = ""
-        self.selected_users = {}  # username -> absolute path under USER_ROOT
-        self.resolved_sources = {}  # button name -> list[absolute paths]
+        self.selected_users = {}        # username -> absolute path under USER_ROOT
+        self.resolved_sources = {}      # button name -> list[absolute paths]
         self._backup_queue = []
+        self.keep_screen_on_running = False
 
         # UI layout
         central_widget = QWidget()
@@ -389,7 +511,12 @@ class MainWindow(QMainWindow):
         # Keep Screen On
         self.setup_keep_screen_on(layout, 8, cols)
 
-        # Hidden placeholder for layout symmetry
+        # Hash verify checkbox
+        self.verify_checkbox = QCheckBox("Verify Copies (MD5)", self)
+        self.verify_checkbox.setChecked(True)
+        layout.addWidget(self.verify_checkbox, 7, 0, 1, cols)
+
+        # Hidden placeholder for layout symmetry (dedupe table holder)
         self.setup_dedupe_table(layout, 9, cols)
 
         # Backup location button
@@ -420,7 +547,6 @@ class MainWindow(QMainWindow):
                 "Backup Desktop": (os.path.join("{user}", "Desktop"), ["*"], "Desktop"),
                 "Backup Downloads": (os.path.join("{user}", "Downloads"), ["*"], "Downloads"),
             }
-
         self.backup_sources = user_subpaths
 
         # Create backup buttons
@@ -428,7 +554,7 @@ class MainWindow(QMainWindow):
         for idx, (name, (subpath_tpl, pats, dest)) in enumerate(self.backup_sources.items()):
             btn = self.create_button(name, lambda checked=False, n=name: self.trigger_backup(n))
             btn.setToolTip(f"Backup all files from selected users' {dest} folders.")
-            btn.setFixedSize(200, 42)
+            btn.setFixedSize(220, 44)
             btn.setEnabled(False)
             self.backup_buttons.append((btn, name))
             row = 1 + (idx // cols)
@@ -441,19 +567,19 @@ class MainWindow(QMainWindow):
         self.organize_button = QPushButton("Organize Directory", self)
         self.organize_button.setToolTip("Organize all files in a selected directory into subfolders by extension.")
         self.organize_button.clicked.connect(self.organize_directory)
-        self.organize_button.setFixedSize(200, 42)
+        self.organize_button.setFixedSize(220, 44)
         layout.addWidget(self.organize_button, action_row, 0)
 
         self.dedup_button = QPushButton("De-Duplicate", self)
         self.dedup_button.setToolTip("Scan a folder for duplicate files and take action on them.")
         self.dedup_button.clicked.connect(self.run_deduplication)
-        self.dedup_button.setFixedSize(200, 42)
+        self.dedup_button.setFixedSize(220, 44)
         layout.addWidget(self.dedup_button, action_row, 1)
 
         self.license_button = QPushButton("Scan for License Keys", self)
         self.license_button.setToolTip("Scan your system for software license keys and save a report.")
         self.license_button.clicked.connect(self.scan_for_license_keys)
-        self.license_button.setFixedSize(200, 42)
+        self.license_button.setFixedSize(220, 44)
         layout.addWidget(self.license_button, action_row, 2)
 
         # Select users button
@@ -461,13 +587,13 @@ class MainWindow(QMainWindow):
         self.select_users_button = QPushButton("Select User(s) for Backup", self)
         self.select_users_button.setToolTip("Pick one or more user profiles to include in backups.")
         self.select_users_button.clicked.connect(self.select_users_for_backup)
-        self.select_users_button.setFixedSize(220, 42)
+        self.select_users_button.setFixedSize(240, 44)
         layout.addWidget(self.select_users_button, select_users_row, 0, 1, cols)
 
         # Spacer
         total_rows = 1 + ((len(self.backup_sources) + cols - 1) // cols)
-        layout.setRowStretch(total_rows + 1, 1)
-        layout.addItem(QSpacerItem(0, 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding), total_rows + 1, 0, 1, cols)
+        layout.setRowStretch(total_rows + 2, 1)
+        layout.addItem(QSpacerItem(0, 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding), total_rows + 2, 0, 1, cols)
 
         # Auto-refresh timer
         self.refresh_timer = QTimer(self)
@@ -616,7 +742,7 @@ class MainWindow(QMainWindow):
             btn.setEnabled(bool(self.resolved_sources.get(name)))
 
     # ------------------------------------------------------------------
-    # Backup flow (backup/<user>/<folder>)
+    # Backup flow (permissions first, then backup)
     # ------------------------------------------------------------------
     def trigger_backup(self, name: str):
         paths = self.resolved_sources.get(name)
@@ -625,6 +751,8 @@ class MainWindow(QMainWindow):
             return
         _, patterns, dest = self.backup_sources[name]
         self._backup_queue = []
+        self._pending_permission_update = []
+
         for p in paths:
             user = os.path.basename(os.path.dirname(p))
             destination_root = os.path.join(self.backup_location, user, dest)
@@ -632,6 +760,48 @@ class MainWindow(QMainWindow):
             log_file = new_log_file(destination_root, f"backup_{dest}_{user}")
             log_line(log_file, f"Preparing backup for {user}:{dest}\n  Source: {p}\n  Destination root: {destination_root}")
             self._backup_queue.append((p, patterns, destination_root, log_file))
+            self._pending_permission_update.append((p, log_file))
+
+        # Start permission update before backup
+        self._start_permission_update()
+
+    def _start_permission_update(self):
+        if not self._pending_permission_update:
+            self._start_next_backup()
+            return
+
+        paths = [p for p, _ in self._pending_permission_update]
+        log_file = self._pending_permission_update[0][1]
+
+        self.perm_dialog = QProgressDialog("Updating permissions...", "Cancel", 0, 100, self)
+        self.perm_dialog.setWindowTitle("Permission Update Progress")
+        self.perm_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.perm_dialog.setValue(0)
+        self.perm_dialog.canceled.connect(self._cancel_permission_update)
+
+        self.perm_worker = PermissionUpdateWorker(paths, log_file)
+        self.perm_worker.progress.connect(self._update_perm_progress)
+        self.perm_worker.finished.connect(self._permission_update_finished)
+        self.perm_worker.start()
+        self.perm_dialog.show()
+
+    def _update_perm_progress(self, processed, total, current_path):
+        pct = int((processed / max(1, total)) * 100)
+        pct = min(100, max(0, pct))
+        self.perm_dialog.setValue(pct)
+        self.perm_dialog.setLabelText(f"Setting permissions: {current_path} ({pct}%)")
+
+    def _cancel_permission_update(self):
+        if hasattr(self, 'perm_worker') and self.perm_worker.isRunning():
+            self.perm_worker.cancel()
+            self.perm_dialog.setLabelText("Cancelling permission update...")
+
+    def _permission_update_finished(self, success, message):
+        self.perm_dialog.close()
+        if not success:
+            QMessageBox.warning(self, "Permission Update", message)
+            self._backup_queue = []
+            return
         self._start_next_backup()
 
     def _start_next_backup(self):
@@ -654,7 +824,8 @@ class MainWindow(QMainWindow):
         self.progress_dialog.canceled.connect(self.cancel_backup)
         self.progress_dialog.show()
 
-        self.worker = BackupWorker(source_dir, destination_root, patterns, log_file)
+        verify_hash = self.verify_checkbox.isChecked()
+        self.worker = BackupWorker(source_dir, destination_root, patterns, log_file, verify_hash=verify_hash)
         self.worker.progress_update.connect(self.update_progress)
         self.worker.finished.connect(self.backup_finished)
         self.worker.start()
@@ -667,7 +838,10 @@ class MainWindow(QMainWindow):
         else:
             pct = 0
         self.progress_dialog.setValue(pct)
-        self.progress_dialog.setLabelText(f"Processing: {current_file} ({pct}%) — {copied_size} / {total} bytes @ {int(speed)} B/s")
+        self.progress_dialog.setLabelText(
+            f"{files_processed} files | {copied_size} / {total} bytes "
+            f"({pct}%) @ {int(speed)} B/s\nCurrent: {current_file} ({file_size} bytes)"
+        )
 
     def cancel_backup(self):
         if hasattr(self, 'worker') and self.worker.isRunning():
@@ -778,7 +952,7 @@ class MainWindow(QMainWindow):
         delete_btn = action_box.addButton("Delete Duplicates", QMessageBox.ButtonRole.AcceptRole)
         move_btn = action_box.addButton("Move Duplicates", QMessageBox.ButtonRole.ActionRole)
         report_btn = action_box.addButton("Save Report", QMessageBox.ButtonRole.ActionRole)
-        cancel_btn = action_box.addButton(QMessageBox.StandardButton.Cancel)
+        action_box.addButton(QMessageBox.StandardButton.Cancel)
         action_box.exec()
 
         log_file = new_log_file(directory, "dedupe")
@@ -829,21 +1003,15 @@ class MainWindow(QMainWindow):
     def find_duplicates(self, directory, min_size=0, file_extensions=None):
         hashes = {}
         duplicates = {}
-        visited = set()
-        for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
-            real_dir = os.path.realpath(dirpath)
-            if real_dir in visited:
-                continue
-            visited.add(real_dir)
+        for dirpath, dirnames, filenames in fast_scan(directory):
             for filename in filenames:
                 if file_extensions and not filename.lower().endswith(tuple(file_extensions)):
                     continue
-                filepath = os.path.join(dirpath, filename)
+                filepath = os.path.join(dirpath, os.path.basename(filename)) if not os.path.isabs(filename) else filename
                 try:
-                    size_ok = os.path.getsize(filepath) >= min_size
+                    if os.path.getsize(filepath) < min_size:
+                        continue
                 except Exception:
-                    size_ok = False
-                if not size_ok:
                     continue
                 try:
                     file_hash = chunked_file_hash(filepath)
@@ -870,20 +1038,20 @@ class MainWindow(QMainWindow):
             if not self._is_user_admin():
                 resp = QMessageBox.question(
                     self,
-                    "Administrator Privileges Required",
+                    "Administrator Privileges Recommended",
                     "Scanning the registry works best with administrator rights.\n\nRestart this app as Administrator now?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if resp == QMessageBox.StandardButton.Yes:
                     self._restart_as_admin()
-                    return  # Current process will continue only if elevation failed
+                    return  # If relaunch succeeded, current process will quit
                 # else continue without admin (limited scan)
 
         # Start worker
         root_for_logs = self.backup_location or os.getcwd()
         self.lic_worker = LicenseScanWorker(root_for_logs)
 
-        # Progress dialog (we'll use total = number of root paths/files)
+        # Progress dialog
         self.lic_prog = QProgressDialog("Scanning for license keys...", "Cancel", 0, 100, self)
         self.lic_prog.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.lic_prog.setAutoClose(False)
@@ -901,7 +1069,6 @@ class MainWindow(QMainWindow):
         def on_finished(results: dict, log_file: str):
             self.lic_prog.close()
             if results:
-                # Offer to save report
                 save_path, _ = QFileDialog.getSaveFileName(self, "Save License Keys Report", "licenses.json", "JSON Files (*.json);;All Files (*)")
                 if save_path:
                     with open(save_path, 'w', encoding='utf-8') as f:
@@ -937,22 +1104,20 @@ class MainWindow(QMainWindow):
 
     def _restart_as_admin(self):
         try:
-            import ctypes, sys
-            params = ' '.join([f'"{a}"' for a in sys.argv])
-            # Attempt to relaunch the same interpreter with the same script and args
-            r = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+            import ctypes, sys as _sys
+            params = ' '.join([f'"{a}"' for a in _sys.argv])
+            r = ctypes.windll.shell32.ShellExecuteW(None, "runas", _sys.executable, params, None, 1)
             if r <= 32:
                 QMessageBox.warning(self, "Elevation", "Failed to restart as Administrator. You can still run a limited scan.")
             else:
-                # Successfully launched elevated instance; exit current
                 QApplication.instance().quit()
         except Exception as e:
             QMessageBox.warning(self, "Elevation", f"Could not request elevation: {e}")
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Entrypoint
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
