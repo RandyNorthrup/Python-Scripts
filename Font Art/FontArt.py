@@ -1,7 +1,9 @@
 import os, platform
 from pyfiglet import Figlet
 
-text = Figlet(font="bubble")
+
+## Set the font here:
+text = Figlet(font="3-d")
 
 # Clear screen cross-platform
 if os.name == "nt":
