@@ -1,4 +1,10 @@
 import os, sys, shutil, time, hashlib, datetime, json
+import threading
+import random
+try:
+    import win32api, win32con
+except ImportError:
+    win32api = win32con = None
 from PySide6.QtWidgets import (
     QMainWindow, QApplication, QPushButton, QWidget, QFileDialog, QMessageBox,
     QGridLayout, QProgressDialog, QSpacerItem, QSizePolicy
@@ -89,6 +95,36 @@ class BackupWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+
+    def setup_keep_screen_on(self, layout, row, cols):
+        from PySide6.QtWidgets import QCheckBox, QLabel
+        self.keep_screen_on_checkbox = QCheckBox("Keep Screen On", self)
+        self.keep_screen_on_checkbox.stateChanged.connect(self.toggle_keep_screen_on)
+        layout.addWidget(self.keep_screen_on_checkbox, row, 0, 1, cols)
+        self.keep_screen_on_thread = None
+        self.keep_screen_on_running = False
+        # Disable if not Windows or win32api unavailable
+        if sys.platform != "win32" or not win32api or not win32con:
+            self.keep_screen_on_checkbox.setEnabled(False)
+            self.keep_screen_on_checkbox.setToolTip("This feature is only available on Windows with pywin32 installed.")
+
+    def toggle_keep_screen_on(self, state):
+        if state and win32api and win32con:
+            self.keep_screen_on_running = True
+            if not self.keep_screen_on_thread or not self.keep_screen_on_thread.is_alive():
+                self.keep_screen_on_thread = threading.Thread(target=self.keep_screen_on_worker, daemon=True)
+                self.keep_screen_on_thread.start()
+        else:
+            self.keep_screen_on_running = False
+
+    def keep_screen_on_worker(self):
+        while self.keep_screen_on_running:
+            x = random.randint(0, 100)
+            y = random.randint(0, 100)
+            win32api.SetCursorPos((x, y))
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, x, y, 0, 0)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, x, y, 0, 0)
+            time.sleep(15)
     def __init__(self):
         super().__init__()
 
@@ -109,6 +145,9 @@ class MainWindow(QMainWindow):
         for c in range(cols):
             layout.setColumnStretch(c, 1)
         # -------------------------------------------------
+
+        # Add Keep Screen On checkbox at the top
+        self.setup_keep_screen_on(layout, 1, cols)
 
         # Set Backup Location Button (spans top row)
         self.backup_location_button = QPushButton("Set Backup Location", self)
