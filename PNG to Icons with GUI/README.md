@@ -1,4 +1,4 @@
-# PNG to Icon Converter (GUI)
+# PNG/SVG to Icon Converter (GUI)
 
 A simple Python GUI tool to convert PNG and SVG images into icon formats for Windows (.ico), macOS (.icns), and Linux (multiple PNG sizes). Built with PySide6, Pillow, and CairoSVG.
 
