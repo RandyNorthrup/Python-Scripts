@@ -4,7 +4,7 @@ import subprocess
 import shutil
 import platform
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QTextEdit, QCheckBox
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QTextEdit, QCheckBox, QComboBox, QSpinBox
 )
 from PySide6.QtCore import Qt, QThread, Signal
 
@@ -26,12 +26,14 @@ class CloneThread(QThread):
     progress = Signal(str)
     finished = Signal(str)
 
-    def __init__(self, url, docker_name, save_path, build_docker):
+    def __init__(self, url, docker_name, save_path, build_docker, size_cap=None, throttle=None):
         super().__init__()
         self.url = url
         self.docker_name = docker_name
         self.save_path = save_path
         self.build_docker = build_docker
+        self.size_cap = size_cap
+        self.throttle = throttle
 
     def run(self):
         log = []
@@ -62,9 +64,14 @@ class CloneThread(QThread):
         os.makedirs(temp_project_folder, exist_ok=True)
         # Clone website using wget
         log_msg(f'Cloning {self.url} to {temp_project_folder}')
+        # Build wget command with options
         wget_cmd = [
             'wget', '-e', 'robots=off', '--mirror', '--convert-links', '--adjust-extension', '--page-requisites', '--no-parent', self.url, '-P', temp_project_folder
         ]
+        if self.size_cap:
+            wget_cmd += ['--quota', str(self.size_cap)]
+        if self.throttle:
+            wget_cmd += ['--limit-rate', str(self.throttle)]
         try:
             result = subprocess.run(wget_cmd, capture_output=True, text=True)
             log_msg(result.stdout)
@@ -149,6 +156,40 @@ class DockerClonerGUI(QWidget):
         self.build_checkbox = QCheckBox('Build Docker image after clone (requires Docker)')
         layout.addWidget(self.build_checkbox)
 
+        # Download size cap controls
+        self.size_cap_checkbox = QCheckBox('Limit download size')
+        layout.addWidget(self.size_cap_checkbox)
+        size_hbox = QHBoxLayout()
+        self.size_cap_value = QSpinBox()
+        self.size_cap_value.setRange(1, 1000000)
+        self.size_cap_value.setValue(100)
+        size_hbox.addWidget(self.size_cap_value)
+        self.size_cap_unit = QComboBox()
+        self.size_cap_unit.addItems(['MB', 'GB', 'TB'])
+        size_hbox.addWidget(self.size_cap_unit)
+        layout.addLayout(size_hbox)
+        self.size_cap_checkbox.stateChanged.connect(lambda: self.size_cap_value.setEnabled(self.size_cap_checkbox.isChecked()))
+        self.size_cap_checkbox.stateChanged.connect(lambda: self.size_cap_unit.setEnabled(self.size_cap_checkbox.isChecked()))
+        self.size_cap_value.setEnabled(False)
+        self.size_cap_unit.setEnabled(False)
+
+        # Download speed throttle controls
+        self.throttle_checkbox = QCheckBox('Throttle download speed')
+        layout.addWidget(self.throttle_checkbox)
+        throttle_hbox = QHBoxLayout()
+        self.throttle_value = QSpinBox()
+        self.throttle_value.setRange(1, 1000000)
+        self.throttle_value.setValue(1024)
+        throttle_hbox.addWidget(self.throttle_value)
+        self.throttle_unit = QComboBox()
+        self.throttle_unit.addItems(['KB/s', 'MB/s'])
+        throttle_hbox.addWidget(self.throttle_unit)
+        layout.addLayout(throttle_hbox)
+        self.throttle_checkbox.stateChanged.connect(lambda: self.throttle_value.setEnabled(self.throttle_checkbox.isChecked()))
+        self.throttle_checkbox.stateChanged.connect(lambda: self.throttle_unit.setEnabled(self.throttle_checkbox.isChecked()))
+        self.throttle_value.setEnabled(False)
+        self.throttle_unit.setEnabled(False)
+
         self.start_btn = QPushButton('Clone Website & Prepare Docker Output')
         self.start_btn.clicked.connect(self.start_clone)
         self.start_btn.setEnabled(False)
@@ -185,12 +226,24 @@ class DockerClonerGUI(QWidget):
         docker_name = self.docker_name_input.text().strip()
         save_path = self.save_path_display.text().strip()
         build_docker = self.build_checkbox.isChecked()
+        # New options
+        size_cap = None
+        if self.size_cap_checkbox.isChecked():
+            value = self.size_cap_value.value()
+            unit = self.size_cap_unit.currentText()
+            multiplier = {'MB': 1024*1024, 'GB': 1024*1024*1024, 'TB': 1024*1024*1024*1024}[unit]
+            size_cap = value * multiplier
+        throttle = None
+        if self.throttle_checkbox.isChecked():
+            value = self.throttle_value.value()
+            unit = self.throttle_unit.currentText()
+            throttle = value * (1024 if unit == 'KB/s' else 1024*1024)
         # Prevent Docker build if Docker name is empty and build is checked
         if build_docker and not docker_name:
             self.console.append('Docker image name is required to build the image.')
             return
         self.console.clear()
-        self.clone_thread = CloneThread(url, docker_name, save_path, build_docker)
+        self.clone_thread = CloneThread(url, docker_name, save_path, build_docker, size_cap=size_cap, throttle=throttle)
         self.clone_thread.progress.connect(self.update_console)
         self.clone_thread.finished.connect(self.clone_finished)
         self.clone_thread.start()
