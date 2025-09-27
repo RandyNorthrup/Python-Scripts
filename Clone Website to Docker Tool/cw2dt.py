@@ -2,10 +2,18 @@ import sys
 import os
 import subprocess
 import shutil
+import platform
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QTextEdit, QCheckBox
 )
 from PySide6.QtCore import Qt, QThread, Signal
+
+def is_wget_available():
+    try:
+        subprocess.run(['wget', '--version'], capture_output=True, check=True)
+        return True
+    except Exception:
+        return False
 
 def docker_available():
     try:
@@ -30,6 +38,19 @@ class CloneThread(QThread):
         def log_msg(msg):
             log.append(msg)
             self.progress.emit(msg)
+        # Platform checks for wget
+        if not is_wget_available():
+            os_name = platform.system()
+            if os_name == 'Windows':
+                log_msg('Error: wget is not installed. Download from https://eternallybored.org/misc/wget/ and add to PATH.')
+            elif os_name == 'Darwin':
+                log_msg('Error: wget is not installed. Install with Homebrew: brew install wget')
+            elif os_name == 'Linux':
+                log_msg('Error: wget is not installed. Install with: sudo apt install wget (Debian/Ubuntu) or sudo yum install wget (Fedora/RHEL)')
+            else:
+                log_msg('Error: wget is not installed. Please install wget for your platform.')
+            self.finished.emit('\n'.join(log))
+            return
         # Use cloned_sites as temp cache in script directory
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         cache_folder = os.path.join(script_dir, 'cloned_sites')
