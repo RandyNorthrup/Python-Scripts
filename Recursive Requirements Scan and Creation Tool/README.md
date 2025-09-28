@@ -58,7 +58,7 @@ The generated `requirements.txt` will:
 - Be directly usable with:
 
 ```bash
-pip install -r requirements.txt
+cat requirements.txt | xargs -n 1 pip install
 ```
 
 ---
