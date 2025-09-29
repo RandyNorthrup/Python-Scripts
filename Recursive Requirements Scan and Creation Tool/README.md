@@ -59,6 +59,7 @@ The generated `requirements.txt` will:
 
 ```bash
 cat requirements.txt | xargs -n 1 pip install
+Get-Content requirements.txt | ForEach-Object { pip install $_ }
 ```
 
 ---
